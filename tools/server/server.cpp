@@ -5629,6 +5629,7 @@ int main(int argc, char ** argv) {
         // optional: debug_dir: string (default "./")
         // optional: stream: bool (default true)
         // optional: round_idx: int (default -1, 用于同步轮次索引，解决 TTS 异步递增导致的竞态条件)
+        // optional: force_listen: bool (default false, 强制本次 decode 首 token 选择 <|listen|>)
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
             if (ctx_server.octx == nullptr) {
@@ -5637,15 +5638,16 @@ int main(int argc, char ** argv) {
             }
         }
 
-        std::string debug_dir = data.contains("debug_dir") && data.at("debug_dir").is_string() ? data.at("debug_dir").get<std::string>() : std::string("./");
+        std::string debug_dir = data.contains("debug_dir") && data.at("debug_dir").is_string() ? data.at("debug_dir").get<std::string>() : std::string("");
         bool stream = json_value(data, "stream", true);
         int round_idx = json_value(data, "round_idx", -1);  // 🔧 [轮次同步] 从请求中获取 round_idx
+        bool force_listen = json_value(data, "force_listen", false);
 
         if (!stream) {
             bool ok = false;
             {
                 std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
-                ok = stream_decode(ctx_server.octx, debug_dir, round_idx);
+                ok = stream_decode(ctx_server.octx, debug_dir, round_idx, force_listen);
             }
 
             if (!ok) {
@@ -5662,7 +5664,7 @@ int main(int argc, char ** argv) {
         }
 
         // SSE streaming mode: start decode, then read text_queue and stream to client
-        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx](size_t, httplib::DataSink & sink) {
+        const auto chunked_content_provider = [&ctx_server, debug_dir, round_idx, force_listen](size_t, httplib::DataSink & sink) {
             // 🔧 [修复多轮对话] 在启动worker之前先重置状态，避免竞态条件
             {
                 std::lock_guard<std::mutex> lock(ctx_server.octx->text_mtx);
@@ -5672,9 +5674,9 @@ int main(int argc, char ** argv) {
             }
             
             // start decode in a background thread so we can stream text concurrently
-            std::thread worker([&ctx_server, debug_dir, round_idx]() {
+            std::thread worker([&ctx_server, debug_dir, round_idx, force_listen]() {
                 std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
-                (void) stream_decode(ctx_server.octx, debug_dir, round_idx);
+                (void) stream_decode(ctx_server.octx, debug_dir, round_idx, force_listen);
             });
 
             // poll text queue until done
@@ -5765,7 +5767,7 @@ int main(int argc, char ** argv) {
         
         // GPU 配置
         int tts_gpu_layers = json_value(data, "tts_gpu_layers", 99);
-        std::string token2wav_device = json_value(data, "token2wav_device", std::string("gpu:1"));
+        std::string token2wav_device = json_value(data, "token2wav_device", std::string("gpu:0"));
         
         // 🔧 [多实例支持] 可配置的输出目录
         std::string output_dir = json_value(data, "output_dir", std::string("./tools/omni/output"));
@@ -5787,8 +5789,14 @@ int main(int argc, char ** argv) {
         // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
         // params.model.path 已经由 ctx_server.model 提供
         
-        // 视觉编码器后端: "metal"(默认GPU) 或 "coreml"(ANE加速)
-        std::string vision_backend = json_value(data, "vision_backend", std::string("metal"));
+        // 视觉编码器后端: "coreml" 走 ANE，其余值都走通用 GGML 路径。
+        // Linux / CUDA 部署默认不应该落到 "metal" 语义上。
+#ifdef __APPLE__
+        const std::string default_vision_backend = "metal";
+#else
+        const std::string default_vision_backend = "ggml";
+#endif
+        std::string vision_backend = json_value(data, "vision_backend", default_vision_backend);
         if (vision_backend == "coreml") {
             // CoreML 模式：自动从 model_dir/vision/ 下查找 .mlmodelc
             std::string vision_coreml = json_value(data, "vision_coreml_model_path",
@@ -5834,6 +5842,7 @@ int main(int argc, char ** argv) {
             // optional: voice cloning audio during init, index=0
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
                 const std::string voice_audio = data.at("voice_audio");
+                ctx_server.octx->ref_audio_path = voice_audio;
                 if (!voice_audio.empty()) {
                     if (!stream_prefill(ctx_server.octx, voice_audio, /*img*/"", /*index*/0)) {
                         res_error(res, format_error_response("stream_prefill(voice_audio) failed", ERROR_TYPE_SERVER));
@@ -5963,10 +5972,22 @@ int main(int argc, char ** argv) {
             
             // 3. 重置状态变量
             ctx_server.octx->n_past = 0;
+            ctx_server.octx->n_keep = 0;
             ctx_server.octx->tts_all_generated_tokens.clear();
             ctx_server.octx->break_event = false;
             ctx_server.octx->current_turn_ended = false;
             ctx_server.octx->llm_generation_done = false;
+            ctx_server.octx->simplex_round_idx = 0;
+            ctx_server.octx->wav_turn_base = 0;
+            ctx_server.octx->round_start_positions.clear();
+            ctx_server.octx->system_prompt_initialized = false;
+
+            {
+                std::lock_guard<std::mutex> text_lock(ctx_server.octx->text_mtx);
+                ctx_server.octx->text_queue.clear();
+                ctx_server.octx->text_done_flag = false;
+                ctx_server.octx->text_streaming = false;
+            }
             
             // 🔧 [修复卡住问题] 重置 speek_done 为 true
             // 原因：stream_prefill(index=0) 在 warmup_done=true 时会等待 speek_done=true
@@ -6025,29 +6046,55 @@ int main(int argc, char ** argv) {
             }
             
             SRV_INF("%s: update_session_config requested\n", __func__);
+
+            auto rebuild_llm_sampler = [&]() -> bool {
+                if (ctx_server.octx->params == nullptr || ctx_server.octx->model == nullptr) {
+                    SRV_ERR("%s: cannot rebuild sampler because params/model is null\n", __func__);
+                    return false;
+                }
+
+                struct common_sampler * new_sampler =
+                    common_sampler_init(ctx_server.octx->model, ctx_server.octx->params->sampling);
+                if (new_sampler == nullptr) {
+                    SRV_ERR("%s: failed to rebuild LLM sampler\n", __func__);
+                    return false;
+                }
+
+                if (ctx_server.octx->ctx_sampler != nullptr) {
+                    common_sampler_free(ctx_server.octx->ctx_sampler);
+                }
+                ctx_server.octx->ctx_sampler = new_sampler;
+
+                SRV_INF(
+                    "%s: sampler rebuilt (seed=%u temp=%.3f top_k=%d top_p=%.3f repeat_penalty=%.3f repeat_last_n=%d)\n",
+                    __func__,
+                    ctx_server.octx->params->sampling.seed,
+                    ctx_server.octx->params->sampling.temp,
+                    ctx_server.octx->params->sampling.top_k,
+                    ctx_server.octx->params->sampling.top_p,
+                    ctx_server.octx->params->sampling.penalty_repeat,
+                    ctx_server.octx->params->sampling.penalty_last_n
+                );
+                return true;
+            };
             
             // 1. 更新 media_type（如果提供）
-            bool media_type_changed = false;
-            int old_media_type = ctx_server.octx->media_type;
             if (data.contains("media_type")) {
                 int new_media_type = data.at("media_type").get<int>();
                 if (ctx_server.octx->media_type != new_media_type) {
                     SRV_INF("%s: media_type changed from %d to %d\n", __func__, 
                             ctx_server.octx->media_type, new_media_type);
                     ctx_server.octx->media_type = new_media_type;
-                    media_type_changed = true;
                 }
             }
             
             // 2. 更新 duplex_mode（如果提供）
-            bool duplex_mode_changed = false;
             if (data.contains("duplex_mode")) {
                 bool new_duplex_mode = data.at("duplex_mode").get<bool>();
                 if (ctx_server.octx->duplex_mode != new_duplex_mode) {
                     SRV_INF("%s: duplex_mode changed from %d to %d\n", __func__, 
                             ctx_server.octx->duplex_mode, new_duplex_mode);
                     ctx_server.octx->duplex_mode = new_duplex_mode;
-                    duplex_mode_changed = true;
                 }
             }
             
@@ -6096,6 +6143,68 @@ int main(int argc, char ** argv) {
                             ctx_server.octx->high_refresh, new_high_refresh);
                     ctx_server.octx->high_refresh = new_high_refresh;
                 }
+            }
+
+            // 🔧 [与 Python 对齐] 更新 duplex decode 参数
+            if (data.contains("max_new_speak_tokens_per_chunk")) {
+                int new_max_tokens = std::max(1, data.at("max_new_speak_tokens_per_chunk").get<int>());
+                if (ctx_server.octx->max_new_speak_tokens_per_chunk != new_max_tokens) {
+                    SRV_INF("%s: max_new_speak_tokens_per_chunk changed from %d to %d\n", __func__,
+                            ctx_server.octx->max_new_speak_tokens_per_chunk, new_max_tokens);
+                    ctx_server.octx->max_new_speak_tokens_per_chunk = new_max_tokens;
+                }
+            }
+            if (data.contains("listen_prob_scale")) {
+                float new_listen_prob_scale = data.at("listen_prob_scale").get<float>();
+                if (ctx_server.octx->listen_prob_scale != new_listen_prob_scale) {
+                    SRV_INF("%s: listen_prob_scale changed from %.3f to %.3f\n", __func__,
+                            ctx_server.octx->listen_prob_scale, new_listen_prob_scale);
+                    ctx_server.octx->listen_prob_scale = new_listen_prob_scale;
+                }
+            }
+            if (data.contains("listen_top_k")) {
+                int new_listen_top_k = data.at("listen_top_k").is_null()
+                    ? -1
+                    : data.at("listen_top_k").get<int>();
+                if (ctx_server.octx->listen_top_k != new_listen_top_k) {
+                    SRV_INF("%s: listen_top_k changed from %d to %d\n", __func__,
+                            ctx_server.octx->listen_top_k, new_listen_top_k);
+                    ctx_server.octx->listen_top_k = new_listen_top_k;
+                }
+            }
+            if (data.contains("length_penalty")) {
+                float new_length_penalty = data.at("length_penalty").get<float>();
+                if (ctx_server.octx->length_penalty != new_length_penalty) {
+                    SRV_INF("%s: length_penalty changed from %.3f to %.3f\n", __func__,
+                            ctx_server.octx->length_penalty, new_length_penalty);
+                    ctx_server.octx->length_penalty = new_length_penalty;
+                }
+            }
+
+            if (ctx_server.octx->params != nullptr) {
+                if (data.contains("temperature")) {
+                    ctx_server.octx->params->sampling.temp = data.at("temperature").get<float>();
+                }
+                if (data.contains("top_k")) {
+                    ctx_server.octx->params->sampling.top_k = data.at("top_k").get<int>();
+                }
+                if (data.contains("top_p")) {
+                    ctx_server.octx->params->sampling.top_p = data.at("top_p").get<float>();
+                }
+                if (data.contains("repeat_penalty")) {
+                    ctx_server.octx->params->sampling.penalty_repeat = data.at("repeat_penalty").get<float>();
+                }
+                if (data.contains("repeat_last_n")) {
+                    ctx_server.octx->params->sampling.penalty_last_n = data.at("repeat_last_n").get<int>();
+                }
+                if (data.contains("seed")) {
+                    ctx_server.octx->params->sampling.seed = data.at("seed").get<uint32_t>();
+                }
+            }
+
+            if (!rebuild_llm_sampler()) {
+                res_error(res, format_error_response("failed to rebuild sampler", ERROR_TYPE_SERVER));
+                return;
             }
             
             // 3. 清空 KV cache
@@ -6154,18 +6263,16 @@ int main(int argc, char ** argv) {
             // 重置 system_prompt_initialized，让 stream_prefill 重新评估 system prompt
             ctx_server.octx->system_prompt_initialized = false;
             
-            // 5. 重新 prefill system prompt（如果提供 voice_audio）
-            bool voice_audio_used = false;
+            // 5. 更新参考音频并重新 prefill system prompt（如果提供 voice_audio）
             if (data.contains("voice_audio") && data.at("voice_audio").is_string()) {
                 const std::string voice_audio = data.at("voice_audio");
+                ctx_server.octx->ref_audio_path = voice_audio;
                 if (!voice_audio.empty()) {
                     SRV_INF("%s: prefilling voice_audio: %s\n", __func__, voice_audio.c_str());
                     if (!stream_prefill(ctx_server.octx, voice_audio, /*img*/"", /*index*/0)) {
                         res_error(res, format_error_response("stream_prefill(voice_audio) failed", ERROR_TYPE_SERVER));
                         return;
                     }
-                    voice_audio_used = true;
-                    
                     // 🔧 [关键] stream_prefill 完成后设置 n_keep，保护 system prompt
                     ctx_server.octx->n_keep = ctx_server.octx->n_past;
                     
@@ -6174,6 +6281,9 @@ int main(int argc, char ** argv) {
                     
                     SRV_INF("%s: voice_audio prefilled, n_past=%d, n_keep=%d (system prompt protected)\n", __func__, 
                             ctx_server.octx->n_past, ctx_server.octx->n_keep);
+                }
+                else {
+                    SRV_INF("%s: voice_audio cleared for current session\n", __func__);
                 }
             }
             
@@ -6185,6 +6295,18 @@ int main(int argc, char ** argv) {
             {"message", "Session config updated"},
             {"media_type", ctx_server.octx->media_type},
             {"duplex_mode", ctx_server.octx->duplex_mode},
+            {"max_new_speak_tokens_per_chunk", ctx_server.octx->max_new_speak_tokens_per_chunk},
+            {"listen_prob_scale", ctx_server.octx->listen_prob_scale},
+            {"listen_top_k", ctx_server.octx->listen_top_k},
+            {"length_penalty", ctx_server.octx->length_penalty},
+            {"sampling", {
+                {"seed", ctx_server.octx->params ? ctx_server.octx->params->sampling.seed : 0},
+                {"temperature", ctx_server.octx->params ? ctx_server.octx->params->sampling.temp : 0.0f},
+                {"top_k", ctx_server.octx->params ? ctx_server.octx->params->sampling.top_k : 0},
+                {"top_p", ctx_server.octx->params ? ctx_server.octx->params->sampling.top_p : 0.0f},
+                {"repeat_penalty", ctx_server.octx->params ? ctx_server.octx->params->sampling.penalty_repeat : 0.0f},
+                {"repeat_last_n", ctx_server.octx->params ? ctx_server.octx->params->sampling.penalty_last_n : 0}
+            }},
             {"highImage", ctx_server.octx->high_image},
             {"highRefresh", ctx_server.octx->high_refresh},
             {"sliding_window", {

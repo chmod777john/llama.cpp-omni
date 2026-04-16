@@ -1497,7 +1497,9 @@ struct llava_uhd {
                     res.refined_size.width, res.refined_size.height,
                     res.grid_size.width, res.grid_size.height);
 
-            if (!has_slices || max_slice_nums == 0) {
+            // Align with Python get_sliced_grid(): max_slice_nums=1 means "overview only",
+            // not "overview + one refined slice".
+            if (!has_slices || max_slice_nums == 0 || multiple <= 1) {
                 return res;
             }
 

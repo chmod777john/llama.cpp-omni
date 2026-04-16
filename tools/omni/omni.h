@@ -240,6 +240,10 @@ struct omni_context {
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认
     float listen_prob_scale = 1.0f;
+
+    // listen_top_k: 如果 <|listen|> 进入前 K 个候选，则直接返回 listen
+    // -1: 关闭该对齐逻辑
+    int listen_top_k = -1;
     
     // 是否启用双工模式
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
@@ -269,6 +273,16 @@ struct omni_context {
     
     // 🔧 [多实例支持] 可配置的输出目录，避免多个服务实例冲突
     std::string base_output_dir = "./tools/omni/output";
+
+    // decode debug output
+    std::string current_decode_debug_dir = "";
+    bool current_decode_debug_written = false;
+    bool current_decode_force_listen = false;
+    int current_prefill_debug_n_past_before_decode = 0;
+    int current_prefill_debug_last_unit_n_past_before = 0;
+    int current_prefill_debug_last_unit_n_past_after = 0;
+    std::string current_prefill_debug_last_unit_schema = "";
+    std::vector<std::string> current_prefill_debug_units;
     
     // 每次会话，是否清除 kv cache（默认开启自动清理 kv cache）
     bool clean_kvcache = true;
@@ -432,7 +446,8 @@ bool stream_prefill(struct omni_context * ctx_omni,
 
 bool stream_decode(struct omni_context * ctx_omni,
                         std::string debug_dir,
-                        int round_idx = -1);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数
+                        int round_idx = -1,
+                        bool force_listen = false);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数
 
 bool stop_speek(struct omni_context * ctx_omni);
 

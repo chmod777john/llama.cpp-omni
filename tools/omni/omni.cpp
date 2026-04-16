@@ -1025,15 +1025,90 @@ static const char * llama_loop(struct omni_context * ctx_omni, common_params *pa
     return tmp;
 }
 
+struct decode_debug_candidate {
+    int token_id = -1;
+    float logit = -INFINITY;
+    float prob = 0.0f;
+    std::string token;
+};
+
+static std::vector<decode_debug_candidate> collect_top_candidates_from_logits(
+    struct omni_context * ctx_omni,
+    const float * logits,
+    int top_k
+);
+static std::vector<decode_debug_candidate> collect_top_candidates_from_sampler(
+    struct omni_context * ctx_omni,
+    const llama_token_data_array * candidates,
+    int top_k
+);
+static void write_duplex_decode_debug_snapshot(
+    struct omni_context * ctx_omni,
+    const std::vector<decode_debug_candidate> & raw_topk,
+    const std::vector<decode_debug_candidate> & adjusted_topk,
+    const std::vector<decode_debug_candidate> & post_sampler_topk,
+    int listen_rank,
+    llama_token selected_token,
+    const char * decision_reason
+);
+
 // 修改sample_with_hidden来返回token ID（通过引用参数）
 // 🔧 [双工模式] 支持 listen_prob_scale 参数，增加 <|listen|> 的采样概率
 // 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
 static const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states, llama_token & token_id) {
     float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+    static std::string ret;
+    const bool should_dump_debug =
+        ctx_omni->duplex_mode &&
+        !ctx_omni->current_decode_debug_dir.empty() &&
+        !ctx_omni->current_decode_debug_written;
+    std::vector<decode_debug_candidate> raw_topk;
+    std::vector<decode_debug_candidate> adjusted_topk;
+    int listen_rank = -1;
+
+    if (should_dump_debug && logits != nullptr) {
+        raw_topk = collect_top_candidates_from_logits(ctx_omni, logits, 10);
+    }
     
     // 🔧 [双工模式] 在采样前调整 logits
     if (ctx_omni->duplex_mode) {
         if (logits != nullptr) {
+            if (ctx_omni->current_decode_force_listen && ctx_omni->special_token_listen >= 0) {
+                if (should_dump_debug) {
+                    adjusted_topk = collect_top_candidates_from_logits(ctx_omni, logits, 10);
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+                    const int n_vocab = llama_vocab_n_tokens(vocab);
+                    const float listen_logit = logits[ctx_omni->special_token_listen];
+                    listen_rank = 0;
+                    for (int tok = 0; tok < n_vocab; ++tok) {
+                        if (tok == ctx_omni->special_token_listen) {
+                            continue;
+                        }
+                        if (logits[tok] > listen_logit) {
+                            ++listen_rank;
+                        }
+                    }
+                }
+                const llama_token id = ctx_omni->special_token_listen;
+                token_id = id;
+                if (should_dump_debug) {
+                    write_duplex_decode_debug_snapshot(
+                        ctx_omni,
+                        raw_topk,
+                        adjusted_topk,
+                        {},
+                        listen_rank,
+                        id,
+                        "force_listen"
+                    );
+                    ctx_omni->current_decode_debug_written = true;
+                }
+                common_sampler_accept(smpl, id, true);
+                ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+                eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+                return ret.c_str();
+            }
+
             // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
             // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
             if (ctx_omni->special_token_listen >= 0) {
@@ -1053,6 +1128,74 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             // 如果不禁止，模型可能生成 <|speak|> → <|tts_pad|> → <|chunk_eos|>，导致无有效输出
             if (ctx_omni->special_token_tts_pad >= 0) {
                 logits[ctx_omni->special_token_tts_pad] = -INFINITY;
+            }
+
+            // 3. 🔧 [与 Python 对齐] duplex 模式下对 <|turn_eos|> 应用长度惩罚
+            if (ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
+                float eos_logit = logits[ctx_omni->special_token_turn_eos];
+                if (eos_logit > 0) {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->length_penalty;
+                } else {
+                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->length_penalty;
+                }
+            }
+
+            // 4. 🔧 [与 Python 对齐] 如果 listen 进入前 K 候选，直接返回 listen
+            // 这里按调整后的 logits 计算 rank，用于逼近 Python StreamDecoder 的 listen_top_k 策略。
+            if (ctx_omni->listen_top_k > 0 && ctx_omni->special_token_listen >= 0) {
+                const float listen_logit = logits[ctx_omni->special_token_listen];
+                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+                const int n_vocab = llama_vocab_n_tokens(vocab);
+                listen_rank = 0;
+                for (int tok = 0; tok < n_vocab; ++tok) {
+                    if (tok == ctx_omni->special_token_listen) {
+                        continue;
+                    }
+                    if (logits[tok] > listen_logit) {
+                        ++listen_rank;
+                    }
+                }
+                if (should_dump_debug) {
+                    adjusted_topk = collect_top_candidates_from_logits(ctx_omni, logits, 10);
+                }
+                if (listen_rank < ctx_omni->listen_top_k) {
+                    const llama_token id = ctx_omni->special_token_listen;
+                    token_id = id;
+                    if (should_dump_debug) {
+                        write_duplex_decode_debug_snapshot(
+                            ctx_omni,
+                            raw_topk,
+                            adjusted_topk,
+                            {},
+                            listen_rank,
+                            id,
+                            "listen_top_k"
+                        );
+                        ctx_omni->current_decode_debug_written = true;
+                    }
+                    common_sampler_accept(smpl, id, true);
+                    ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+                    eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+                    return ret.c_str();
+                }
+            }
+
+            if (should_dump_debug && adjusted_topk.empty()) {
+                adjusted_topk = collect_top_candidates_from_logits(ctx_omni, logits, 10);
+                if (ctx_omni->special_token_listen >= 0) {
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+                    const int n_vocab = llama_vocab_n_tokens(vocab);
+                    const float listen_logit = logits[ctx_omni->special_token_listen];
+                    listen_rank = 0;
+                    for (int tok = 0; tok < n_vocab; ++tok) {
+                        if (tok == ctx_omni->special_token_listen) {
+                            continue;
+                        }
+                        if (logits[tok] > listen_logit) {
+                            ++listen_rank;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1074,8 +1217,20 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
     token_id = id;  // 保存token ID
+    if (should_dump_debug) {
+        const auto * candidates = common_sampler_get_candidates(smpl, true);
+        write_duplex_decode_debug_snapshot(
+            ctx_omni,
+            raw_topk,
+            adjusted_topk,
+            collect_top_candidates_from_sampler(ctx_omni, candidates, 10),
+            listen_rank,
+            id,
+            "sampler"
+        );
+        ctx_omni->current_decode_debug_written = true;
+    }
     common_sampler_accept(smpl, id, true);
-    static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
         ret = "</s>";
     } else {
@@ -2270,6 +2425,289 @@ static void save_hidden_states_to_file(const char* filepath, const float* hidden
     fwrite(&hidden_size, sizeof(int32_t), 1, f);
     fwrite(hidden_states, sizeof(float), hidden_size, f);
     fclose(f);
+}
+
+static std::string json_escape_string(const std::string & input) {
+    std::ostringstream oss;
+    for (const unsigned char ch : input) {
+        switch (ch) {
+            case '\\': oss << "\\\\"; break;
+            case '"': oss << "\\\""; break;
+            case '\b': oss << "\\b"; break;
+            case '\f': oss << "\\f"; break;
+            case '\n': oss << "\\n"; break;
+            case '\r': oss << "\\r"; break;
+            case '\t': oss << "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    oss << "\\u"
+                        << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    oss << static_cast<char>(ch);
+                }
+        }
+    }
+    return oss.str();
+}
+
+static std::vector<decode_debug_candidate> collect_top_candidates_from_logits(
+    struct omni_context * ctx_omni,
+    const float * logits,
+    int top_k
+) {
+    std::vector<decode_debug_candidate> out;
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || logits == nullptr || top_k <= 0) {
+        return out;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        return out;
+    }
+
+    float max_logit = -INFINITY;
+    for (int tok = 0; tok < n_vocab; ++tok) {
+        if (logits[tok] > max_logit) {
+            max_logit = logits[tok];
+        }
+    }
+
+    double prob_sum = 0.0;
+    for (int tok = 0; tok < n_vocab; ++tok) {
+        if (std::isfinite(logits[tok])) {
+            prob_sum += std::exp((double) logits[tok] - (double) max_logit);
+        }
+    }
+
+    std::vector<std::pair<float, int>> scored;
+    scored.reserve(n_vocab);
+    for (int tok = 0; tok < n_vocab; ++tok) {
+        scored.emplace_back(logits[tok], tok);
+    }
+
+    const int keep = std::min(top_k, n_vocab);
+    std::partial_sort(
+        scored.begin(),
+        scored.begin() + keep,
+        scored.end(),
+        [](const std::pair<float, int> & a, const std::pair<float, int> & b) {
+            return a.first > b.first;
+        }
+    );
+
+    out.reserve(keep);
+    for (int i = 0; i < keep; ++i) {
+        const float logit = scored[i].first;
+        const int token_id = scored[i].second;
+        float prob = 0.0f;
+        if (std::isfinite(logit) && prob_sum > 0.0) {
+            prob = (float) (std::exp((double) logit - (double) max_logit) / prob_sum);
+        }
+        out.push_back({
+            token_id,
+            logit,
+            prob,
+            common_token_to_piece(ctx_omni->ctx_llama, token_id),
+        });
+    }
+
+    return out;
+}
+
+static std::vector<decode_debug_candidate> collect_top_candidates_from_sampler(
+    struct omni_context * ctx_omni,
+    const llama_token_data_array * candidates,
+    int top_k
+) {
+    std::vector<decode_debug_candidate> out;
+    if (ctx_omni == nullptr || ctx_omni->ctx_llama == nullptr || candidates == nullptr || top_k <= 0) {
+        return out;
+    }
+
+    const int keep = std::min(top_k, (int) candidates->size);
+    out.reserve(keep);
+    for (int i = 0; i < keep; ++i) {
+        const auto & cand = candidates->data[i];
+        out.push_back({
+            (int) cand.id,
+            cand.logit,
+            cand.p,
+            common_token_to_piece(ctx_omni->ctx_llama, cand.id),
+        });
+    }
+    return out;
+}
+
+static void append_decode_candidates_json(
+    std::ostringstream & oss,
+    const std::vector<decode_debug_candidate> & candidates
+) {
+    oss << "[";
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto & cand = candidates[i];
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << "{"
+            << "\"rank\":" << (i + 1) << ","
+            << "\"token_id\":" << cand.token_id << ","
+            << "\"token\":\"" << json_escape_string(cand.token) << "\","
+            << "\"logit\":" << cand.logit << ","
+            << "\"prob\":" << cand.prob
+            << "}";
+    }
+    oss << "]";
+}
+
+static void append_json_string_array(
+    std::ostringstream & oss,
+    const std::vector<std::string> & values
+) {
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << "\"" << json_escape_string(values[i]) << "\"";
+    }
+    oss << "]";
+}
+
+static void reset_prefill_debug_state(struct omni_context * ctx_omni) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+    ctx_omni->current_decode_force_listen = false;
+    ctx_omni->current_prefill_debug_n_past_before_decode = 0;
+    ctx_omni->current_prefill_debug_last_unit_n_past_before = 0;
+    ctx_omni->current_prefill_debug_last_unit_n_past_after = 0;
+    ctx_omni->current_prefill_debug_last_unit_schema.clear();
+    ctx_omni->current_prefill_debug_units.clear();
+}
+
+static std::string build_prefill_schema_for_embeds(
+    struct omni_context * ctx_omni,
+    const struct omni_embeds * embeds,
+    int hidden_size
+) {
+    if (ctx_omni == nullptr || embeds == nullptr || hidden_size <= 0) {
+        return "";
+    }
+
+    std::ostringstream schema;
+    const bool has_vision = !embeds->vision_embed.empty();
+    const int n_audio_tokens = (int) embeds->audio_embed.size() / hidden_size;
+
+    if (ctx_omni->duplex_mode) {
+        schema << "<unit>";
+    }
+
+    if (has_vision) {
+        const int n_chunks = (int) embeds->vision_embed.size();
+        const int tokens_per_chunk = (int) embeds->vision_embed[0].size() / hidden_size;
+        schema << "<image>[img_embed_" << tokens_per_chunk << "]</image>";
+        for (int i = 1; i < n_chunks; ++i) {
+            schema << "<slice>[img_embed_" << tokens_per_chunk << "]</slice>";
+        }
+        if (n_chunks > 1) {
+            schema << "\n";
+        }
+    }
+
+    if (n_audio_tokens > 0) {
+        if (!ctx_omni->duplex_mode) {
+            schema << "<|audio_start|>";
+        }
+        schema << "[audio_embed_" << n_audio_tokens << "]";
+        if (!ctx_omni->duplex_mode) {
+            schema << "<|audio_end|>";
+        }
+    }
+
+    return schema.str();
+}
+
+static void record_prefill_debug_unit(
+    struct omni_context * ctx_omni,
+    const std::string & unit_schema,
+    int n_past_before,
+    int n_past_after
+) {
+    if (ctx_omni == nullptr) {
+        return;
+    }
+    ctx_omni->current_prefill_debug_last_unit_n_past_before = n_past_before;
+    ctx_omni->current_prefill_debug_last_unit_n_past_after = n_past_after;
+    ctx_omni->current_prefill_debug_last_unit_schema = unit_schema;
+    ctx_omni->current_prefill_debug_units.push_back(unit_schema);
+}
+
+static void write_duplex_decode_debug_snapshot(
+    struct omni_context * ctx_omni,
+    const std::vector<decode_debug_candidate> & raw_topk,
+    const std::vector<decode_debug_candidate> & adjusted_topk,
+    const std::vector<decode_debug_candidate> & post_sampler_topk,
+    int listen_rank,
+    llama_token selected_token,
+    const char * decision_reason
+) {
+    if (ctx_omni == nullptr || ctx_omni->current_decode_debug_dir.empty()) {
+        return;
+    }
+    if (!cross_platform_mkdir_p(ctx_omni->current_decode_debug_dir)) {
+        LOG_ERR("Failed to create decode debug dir: %s\n", ctx_omni->current_decode_debug_dir.c_str());
+        return;
+    }
+
+    const std::string out_path = ctx_omni->current_decode_debug_dir + "/first_decode_step.json";
+    std::ofstream out(out_path, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+        LOG_ERR("Failed to open decode debug file: %s\n", out_path.c_str());
+        return;
+    }
+
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"decision_reason\":\"" << json_escape_string(decision_reason ? decision_reason : "") << "\",";
+    oss << "\"listen_rank\":" << listen_rank << ",";
+    oss << "\"selected_token\":{"
+        << "\"token_id\":" << (int) selected_token << ","
+        << "\"token\":\"" << json_escape_string(common_token_to_piece(ctx_omni->ctx_llama, selected_token)) << "\""
+        << "},";
+    oss << "\"sampling\":{"
+        << "\"seed\":" << (ctx_omni->params ? ctx_omni->params->sampling.seed : 0) << ","
+        << "\"temperature\":" << (ctx_omni->params ? ctx_omni->params->sampling.temp : 0.0f) << ","
+        << "\"top_k\":" << (ctx_omni->params ? ctx_omni->params->sampling.top_k : 0) << ","
+        << "\"top_p\":" << (ctx_omni->params ? ctx_omni->params->sampling.top_p : 0.0f) << ","
+        << "\"repeat_penalty\":" << (ctx_omni->params ? ctx_omni->params->sampling.penalty_repeat : 0.0f) << ","
+        << "\"repeat_last_n\":" << (ctx_omni->params ? ctx_omni->params->sampling.penalty_last_n : 0)
+        << "},";
+    oss << "\"listen_prob_scale\":" << ctx_omni->listen_prob_scale << ",";
+    oss << "\"listen_top_k\":" << ctx_omni->listen_top_k << ",";
+    oss << "\"length_penalty\":" << ctx_omni->length_penalty << ",";
+    oss << "\"prefill_state\":{"
+        << "\"n_past_before_decode\":" << ctx_omni->current_prefill_debug_n_past_before_decode << ","
+        << "\"n_keep_like_system_prompt\":" << ctx_omni->n_keep << ","
+        << "\"prefill_unit_count\":" << ctx_omni->current_prefill_debug_units.size() << ","
+        << "\"latest_unit_n_past_before\":" << ctx_omni->current_prefill_debug_last_unit_n_past_before << ","
+        << "\"latest_unit_n_past_after\":" << ctx_omni->current_prefill_debug_last_unit_n_past_after << ","
+        << "\"latest_unit_schema\":\"" << json_escape_string(ctx_omni->current_prefill_debug_last_unit_schema) << "\","
+        << "\"all_unit_schemas\":";
+    append_json_string_array(oss, ctx_omni->current_prefill_debug_units);
+    oss << "},";
+    oss << "\"raw_topk\":";
+    append_decode_candidates_json(oss, raw_topk);
+    oss << ",\"adjusted_topk\":";
+    append_decode_candidates_json(oss, adjusted_topk);
+    oss << ",\"post_sampler_topk\":";
+    append_decode_candidates_json(oss, post_sampler_topk);
+    oss << "}";
+
+    out << oss.str();
+    out.close();
 }
 
 // ========== RAS (Repetition Aware Sampling) Implementation ==========
@@ -4366,6 +4804,8 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             // 遍历所有嵌入数据
             for (int il = 0; il < (int)llm_embeds.size(); ++il) {
                 auto embeds = llm_embeds[il];
+                const int unit_n_past_before = ctx_omni->n_past;
+                const std::string unit_schema = build_prefill_schema_for_embeds(ctx_omni, embeds, hidden_size);
                 
                 // 🔧 [#39 滑动窗口] 注册 unit 开始
                 if (ctx_omni->sliding_window_config.mode != "off") {
@@ -4451,6 +4891,7 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
                     std::string input_type = embeds->vision_embed.size() > 0 ? "omni" : "audio";
                     sliding_window_register_unit_end(ctx_omni, input_type, {}, false);
                 }
+                record_prefill_debug_unit(ctx_omni, unit_schema, unit_n_past_before, ctx_omni->n_past);
                 
                 // 释放嵌入数据的内存（由生产者线程分配）
                 delete embeds;
@@ -8721,6 +9162,9 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
 }
 
 bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
+    if (index == 0) {
+        reset_prefill_debug_state(ctx_omni);
+    }
     
     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
     // 同一轮内的后续 prefill (index >= 1) 不需要等待
@@ -8877,11 +9321,9 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         //把这步完成再开llm线程以防冲突
         ctx_omni->n_keep = ctx_omni->n_past;
         print_with_timestamp("🔒 n_keep 设置为 %d (system prompt tokens)，这部分永远不会被滑动窗口删除\n", ctx_omni->n_keep);
-        // 双工模式：assistant_prompt 不含 <|im_start|>user\n，需要 eval_prefix 补充
-        // 非双工模式：assistant_prompt 末尾已含 <|im_start|>user\n，无需重复添加
-        if (ctx_omni->duplex_mode) {
-            eval_prefix(ctx_omni, ctx_omni->params);
-        }
+        // PyTorch duplex prepare() 在 system prompt 后不会额外补
+        // <|im_start|>user\n，而是直接从后续 <unit> 开始用户输入。
+        // 这里保持同样的 KV 布局，避免首个 decode 前多出 3 个文本 token。
         
         // 🔧 [说明] index=0 时，aud_fname 通常是 ref_audio（用于 voice cloning）
         // ref_audio 已经在上面的 system prompt 初始化中被正确 prefill 了
@@ -9044,7 +9486,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
     return true;
 }
 
-bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx) {
+bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int round_idx, bool force_listen) {
     // NOTE: 不再自动归档旧输出目录，因为这会导致同一 session 中每轮对话的输出被移走
     // 如果需要归档，可以在新 session 开始时（omni_init）手动调用
     // move_old_output_to_archive();
@@ -9077,6 +9519,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     
     // Record start time (t=0) for WAV file naming
     ctx_omni->stream_decode_start_time = std::chrono::high_resolution_clock::now();
+    ctx_omni->current_decode_debug_dir = debug_dir;
+    ctx_omni->current_decode_debug_written = false;
+    ctx_omni->current_decode_force_listen = force_listen;
+    ctx_omni->current_prefill_debug_n_past_before_decode = ctx_omni->n_past;
     
     // 🔧 [诊断] 打印 stream_decode 开始时的关键状态
     print_with_timestamp("📍 stream_decode 开始: n_past=%d, n_keep=%d, n_ctx=%d, duplex_mode=%d\n",
@@ -9153,6 +9599,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         g_decode_cv.wait(lock, []{ return prefill_done; });
         prefill_done = false;
     }
+    ctx_omni->current_prefill_debug_n_past_before_decode = ctx_omni->n_past;
     // 只有启用 TTS 时才设置 speek_done 为 false
     if (ctx_omni->use_tts) {
         ctx_omni->speek_done = false;
